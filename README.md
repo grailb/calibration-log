@@ -2,7 +2,7 @@
 
 An append-only, hash-chained, Bitcoin-timestamped log of predictions made by the GRAILB instrument about GitHub pull requests.
 
-Each record is sealed **before** the PR resolves. The point of this repo is to make it possible for someone who does not trust us to check that claim.
+Each record is sealed **before** before any human reviewer responded. The point of this repo is to make it possible for someone who does not trust us to check that claim.
 
 ```bash
 git clone https://github.com/grailb/calibration-log
