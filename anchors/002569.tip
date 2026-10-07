@@ -1,6 +1,6 @@
 {
   "chain_hash": "e6fd60cda10347be2bd9342f259bb6969f2f0a89bda5362e57ae818a113f0df3",
   "chain_seq": 2569,
-  "chain_version": null,
+  "chain_version": "grailb-chain-v1",
   "sealed_at": "2026-10-07T11:19:59.482461Z"
 }
