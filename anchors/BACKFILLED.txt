@@ -22,3 +22,4 @@
 3103	anchored_late	2026-10-29T03:25:01Z
 3104	anchored_late	2026-10-29T04:05:01Z
 3105	anchored_late	2026-10-29T04:35:02Z
+3106	anchored_late	2026-10-29T08:20:01Z
