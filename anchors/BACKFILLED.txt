@@ -90,3 +90,4 @@
 3171	anchored_late	2026-10-31T08:35:01Z
 3172	anchored_late	2026-10-31T12:05:02Z
 3173	anchored_late	2026-10-31T12:35:01Z
+3174	anchored_late	2026-10-31T12:40:01Z
