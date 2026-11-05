@@ -2,7 +2,7 @@
 
 An append-only, hash-chained, Bitcoin-timestamped log of predictions made by the GRAILB instrument about GitHub pull requests.
 
-Each record is sealed **before** any human reviewer responded. The point of this repo is to make it possible for someone who does not trust us to check that claim.
+Each record is sealed **before** any human reviewer responded. The point of this repo is to make it possible for someone who does not trust us to check that claim, and to say plainly where it can't yet be checked.
 
 ```bash
 git clone https://github.com/grailb/calibration-log
@@ -15,7 +15,30 @@ python verify.py
 
 You don't need a Bitcoin node. Without one, `verify.py` computes from your copy of each anchor the merkle root a specific Bitcoin block must have, then asks two independent public explorers (blockstream.info and mempool.space) for that block's real merkle root. The output says when it relied on them. If you'd rather trust nothing but your own node, pass `--no-explorer`.
 
-The scores, calls and per-PR results built on this log are at [grailb.com/calibration-log](https://grailb.com/calibration-log). Every number there can be traced to a `chain_seq` here.
+The scores, calls and per-PR results built on this log are at [grailb.com/calibration-log](https://grailb.com/calibration-log). Every number there traces to a `chain_seq` here.
+
+---
+
+## Read this first: two limits
+
+### 1. The first 1,051 records were not timestamped when they were sealed
+
+Records `1` to `1051` were sealed and hash-chained, but at the time their only timestamp was this repo's git history. Git history can be rewritten: commit dates are set by whoever makes the commit, and a repo can be force-pushed. We added Bitcoin anchoring after realising that, and the first anchor was taken on **2026-07-14 at 17:56 UTC, in Bitcoin block 958038**.
+
+What that means for those records, precisely:
+
+- **They can't have been altered or added after 2026-07-14 17:56 UTC.** That first anchor commits to the chain tip at the time, and the tip commits to every record before it. Changing any early record now would break the link to an anchor in Bitcoin.
+- **They can't be shown to have been sealed before their pull requests resolved,** for any PR that resolved before 2026-07-14. For those, you have our git history and our word, and you should weigh them accordingly.
+- **For early records whose PR resolved after 2026-07-14, the claim still holds**, because the anchor predates the outcome.
+- **Some early records also show later anchors** (for example seq 1035 to 1049 in block 960000, 2026-07-28). These were stamped afterwards and add nothing; the 2026-07-14 anchor is the earliest bound on everything before it.
+
+From record `1052` on, each record is anchored to Bitcoin within hours of being sealed. `verify.py` reports any record that isn't.
+
+We'd rather publish this than have someone find it.
+
+### 2. The analyses themselves are not public
+
+Each record's `content_hash` commits to the full analysis, but we don't publish the analyses: they name individual reviewers. You can check that every analysis exists and hasn't changed since it was sealed; you can't read them here. Anyone with a serious reason to check them can do so under NDA; see [Checking the analyses](#checking-the-analyses).
 
 ---
 
@@ -54,34 +77,52 @@ The scores, calls and per-PR results built on this log are at [grailb.com/calibr
 
 ## What this proves
 
-**The predictions cannot be altered after the fact.**
-Each `content_hash` commits to the full analysis. The analyses themselves are not public: they name individual reviewers. So today you can't read one, but whenever one is shown (to a design partner, an auditor, or publicly once it can be done without naming anyone), it must hash to the value sealed here, months earlier. We can withhold an analysis; we cannot swap it. `python verify.py --fetch --api <url>` re-derives the hashes for anyone given access.
-
 **No prediction has been quietly removed.**
-Each record includes the previous record's hash and a strictly incrementing sequence number. Deleting a record from the middle of the log leaves a gap and breaks every link after it. This is the property that stops a calibration log from becoming a highlight reel of the predictions that happened to work out.
+Each record includes the previous record's hash and a strictly incrementing sequence number. Deleting a record from the middle of the log leaves a gap and breaks every link after it. This is the property that stops a calibration log from becoming a highlight reel of the predictions that happened to work out. It holds for every record, including the first 1,051.
 
-**The predictions existed by a specific time — and we can't fake that time.**
-This is the part that git alone cannot do. Git commit timestamps are attacker-supplied metadata; `GIT_COMMITTER_DATE=...` is a one-line forgery. So we anchor chain tips to Bitcoin using [OpenTimestamps](https://opentimestamps.org). A confirmed `.ots` proof shows that a given tip hash existed no later than a given Bitcoin block, and because each tip commits to every record before it, one confirmed anchor bounds the age of the whole history behind it. Forging that would require rewriting Bitcoin.
+**The predictions existed by a specific time, and we can't fake that time.**
+This is the part git alone cannot do. So we anchor chain tips to Bitcoin using [OpenTimestamps](https://opentimestamps.org). A confirmed `.ots` proof shows that a given tip existed no later than a given Bitcoin block, and because each tip commits to every record before it, one confirmed anchor bounds the age of the whole history behind it. Forging that would require rewriting Bitcoin. For records `1052` onward the anchor follows the seal by hours. For records `1` to `1051` the bound is 2026-07-14 17:56 UTC; see above.
+
+**The analyses can't be swapped.**
+Each `content_hash` commits to the full analysis. Whenever an analysis is shown to anyone, under NDA now or publicly later, it must hash to the value sealed here. We can withhold an analysis; we can't change one.
 
 **Only the first analysis of a PR counts.**
-`pr_identifier` is `UNIQUE` in the production database. The first seal for a PR is permanent; a second one is rejected, not overwritten. We cannot run the instrument ten times and keep the run we like. This is arguably a stronger guarantee than any of the cryptography above, and no amount of hashing would provide it.
+`pr_identifier` is `UNIQUE` in the production database. The first seal for a PR is permanent; a second one is rejected, not overwritten. We cannot run the instrument ten times and keep the run we like. This is arguably a stronger guarantee than any of the cryptography above, and no amount of hashing would provide it. It is also the one guarantee here you have to take partly on trust, since the database isn't public; what you *can* check is that no `pr_identifier` appears twice in the log.
 
 ## What this does *not* prove
 
 Being precise about this is the point of the exercise.
 
 - **It does not prove the predictions are any good.** That's what the scores are for. This log only establishes that they are *real* and *timely*.
-- **An OTS proof is an upper bound, not an exact time.** It shows a hash existed *no later than* a Bitcoin block. It cannot show the hash wasn't created earlier. For our purposes that's the right direction — "sealed before the PR resolved" is exactly an upper bound — but it is not a claim that the timestamp is precise.
-- **Records newer than the last confirmed anchor are not yet independently timestamped.** OTS confirmation takes a few hours. `verify.py` tells you how many records fall into this window. Until an anchor confirms, the only timestamp on a record is GitHub's — and while commits made through GitHub's API are server-timestamped and signed with GitHub's `web-flow` key, we could still force-push this repo. Treat the unanchored tail with the skepticism it deserves.
-- **What the analyses say.** We don't publish them, because they name people. `content_hash` means we can't hand anyone an *altered* analysis, but nothing here compels us to show you one. The chain proves each record exists; it doesn't let you read it.
-- **The chain does not prove the log is complete with respect to reality.** It proves no record was removed *from the log*. If the instrument were never pointed at a PR at all, nothing here would show that.
+- **It does not prove that records 1 to 1051 were sealed before their pull requests resolved,** for any PR that resolved before 2026-07-14. See above.
+- **An OTS proof is an upper bound, not an exact time.** It shows a hash existed *no later than* a Bitcoin block. It cannot show the hash wasn't created earlier. "Sealed before the PR resolved" is exactly an upper-bound claim, so this is the right direction, but it is not a claim that the timestamp is precise.
+- **Records newer than the last confirmed anchor are not yet independently timestamped.** OTS confirmation takes a few hours. `verify.py` tells you how many records fall into this window. Until an anchor confirms, the only timestamp on a record is GitHub's, which we could overwrite by force-pushing. Treat the unanchored tail with the skepticism it deserves.
+- **What the analyses say.** Not public; see below.
+- **That the log is complete with respect to reality.** The chain proves no record was removed *from the log*. If the instrument were never pointed at a PR at all, nothing here would show that.
+
+## Checking the analyses
+
+The analyses name individual reviewers, so the API that serves them is not public. If you're an investor, design partner, researcher or journalist with a serious reason to check them, we'll give you access under NDA, in a data room or against a private endpoint.
+
+The terms that make this worth doing:
+
+- **You choose the records.** Name any `chain_seq` values you like, or have us draw them at random from a seed you supply. A review where we pick the records proves nothing.
+- **We produce every record you name.** A record we can't or won't produce is itself a finding, and you're free to say so publicly. The chain shows that it exists.
+- **You check the hashes yourself, on your machine.** With access to a private endpoint:
+  ```bash
+  python verify.py --fetch --api <endpoint we give you>
+  ```
+  With files from a data room, see "A result" under [Verifying by hand](#verifying-by-hand).
+- **What you can publish:** whether the hashes matched, and how many records you checked. The NDA covers the content of the analyses, not the outcome of your check.
+
+To ask: kjalleda@gmail.com
 
 ## Verifying by hand
 
 The chain:
 
 ```python
-import json, hashlib
+import json
 from grailb_chain import replay_chain
 
 records = [json.loads(l) for l in open("calibration_log.jsonl") if l.strip()]
@@ -90,29 +131,42 @@ ok, errors = replay_chain(records)
 assert ok, errors
 ```
 
-A timestamp:
+No PR sealed twice:
 
-```bash
-ots verify anchors/000124.tip.ots
-# Success! Bitcoin block N attests existence as of <date>
+```python
+ids = [r["pr_identifier"] for r in records]
+assert len(ids) == len(set(ids))
 ```
 
-Then confirm the anchored tip is actually the chain's tip at that sequence — an anchor over a hash that isn't in the log proves nothing:
+A timestamp, with a Bitcoin node:
 
 ```bash
-cat anchors/000124.tip
-grep '"chain_seq": *124,' calibration_log.jsonl   # the comma keeps 124 from matching 1240
+ots verify anchors/001050.tip.ots
+```
+
+Without one, print the block and merkle root to look up, then compare against any block explorer you trust:
+
+```bash
+ots --no-bitcoin verify anchors/001050.tip.ots
+# To verify manually, check that Bitcoin block 958038 has merkleroot …
+```
+
+Then confirm the anchored tip is actually the chain's tip at that sequence. An anchor over a hash that isn't in the log proves nothing:
+
+```bash
+cat anchors/001050.tip
+grep '"chain_seq": *1050,' calibration_log.jsonl   # the comma keeps 1050 from matching 10500
 ```
 
 The two `chain_hash` values must be identical.
 
-A result, if one has been shared with you:
+A result, if one has been shared with you under NDA:
 
 ```python
 import hashlib, json
 
-record = next(r for r in records if r["chain_seq"] == 124)
-result = json.load(open("result_124.json"))        # however you received it
+record = next(r for r in records if r["chain_seq"] == 1050)
+result = json.load(open("result_1050.json"))       # however you received it
 
 assert hashlib.sha256(
     json.dumps(result, sort_keys=True).encode()   # the canonical form
