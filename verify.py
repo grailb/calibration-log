@@ -28,15 +28,17 @@ What it checks, in order:
      no node, the proof cannot be checked *here* — that is INCOMPLETE, not
      FAILED. `ots info <proof>` shows the attestation without any lookup.
 
-  3. CONTENT (optional, --fetch, needs network)
-     For each record, fetches the full analysis result from the GRAILB API and
-     confirms it hashes to the published content_hash. This step is the only
-     one that depends on GRAILB's infrastructure — and note what that means:
-     GRAILB cannot serve you an *altered* result (the hash would not match),
-     but it can decline to serve you one at all. The chain in step 1 is what
-     tells you a record is missing.
+  3. CONTENT (optional, --fetch, needs network and an API that serves results)
+     For each record, fetches the full analysis result and confirms it hashes
+     to the published content_hash. The analyses are NOT currently served
+     publicly: they name individual reviewers. content_hash still commits to
+     each one, so GRAILB cannot later reveal an *altered* result; it can only
+     decline to reveal one. This step exists for anyone GRAILB grants access to.
+     It is not part of a default run, and its absence does not make a run
+     incomplete.
 
-Exit code 0 if everything checks out.
+Exit codes: 0 verified, 1 failed, 2 incomplete (a check that should have run
+could not, e.g. no Bitcoin node or no `ots`).
 
     pip install opentimestamps-client   # for step 2
 """
@@ -64,6 +66,14 @@ DEFAULT_API = os.getenv("GRAILB_API")
 BITCOIN_MARKER = "BitcoinBlockHeaderAttestation"
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+
+
+def fmt_age(seconds: float) -> str:
+    m = int(seconds // 60)
+    if m < 120:
+        return f"{m} min"
+    h = m // 60
+    return f"{h} h" if h < 48 else f"{h // 24} days"
 
 
 def ok(msg: str) -> None:
@@ -99,6 +109,10 @@ def load_records(path: Path) -> list[dict]:
         if extra:
             sys.exit(f"line {lineno}: unexpected field(s) {sorted(extra)} — this "
                      f"verifier does not know how to hash them")
+        missing = PUBLISHED_FIELDS - set(rec)
+        if missing:
+            sys.exit(f"line {lineno}: missing field(s) {sorted(missing)} — every "
+                     f"published record carries the same key set")
         records.append(rec)
 
     records.sort(key=lambda r: r.get("chain_seq", 0))
@@ -120,6 +134,29 @@ def check_chain(records: list[dict]) -> bool:
         for e in errors:
             bad(e)
     return passed
+
+
+def tip_written_at(repo: Path, tip: Path) -> float:
+    """When this tip was written: the time of the commit that added it.
+
+    NOT the file's mtime. On a fresh clone every file's mtime is the moment of
+    the clone, so a tip left unstamped for months would look "written seconds
+    ago" and be excused by the grace window — on exactly the machines this
+    script is for. Falls back to mtime only for a tip that isn't committed yet
+    (the maintainer's working copy) or when git isn't available.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "log", "--diff-filter=A", "-1", "--format=%ct", "--",
+             str(tip.relative_to(repo))],
+            cwd=repo, capture_output=True, text=True, timeout=20,
+        )
+        out = proc.stdout.strip()
+        if proc.returncode == 0 and out:
+            return float(out.splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return tip.stat().st_mtime
 
 
 def check_stamped(repo: Path, grace_minutes: int = 30) -> bool:
@@ -144,10 +181,11 @@ def check_stamped(repo: Path, grace_minutes: int = 30) -> bool:
     grace = grace_minutes * 60
     missing, too_fresh = [], 0
 
-    for tip in sorted(anchors.glob("*.tip")):
+    tips = sorted(anchors.glob("*.tip"))
+    for tip in tips:
         if tip.with_suffix(".tip.ots").exists():
             continue
-        age = now - tip.stat().st_mtime
+        age = now - tip_written_at(repo, tip)
         if age < grace:
             too_fresh += 1
         else:
@@ -155,17 +193,19 @@ def check_stamped(repo: Path, grace_minutes: int = 30) -> bool:
 
     if missing:
         for tip, age in missing:
-            bad(f"{tip.name}: no .ots after {int(age // 60)} min — NOT ANCHORED. "
-                f"Is the stamping cron running?")
-        print(f"{DIM}        Run ots_anchor.py, then check the cron. Records at or above "
-              f"the oldest unstamped tip have no independent timestamp.{RESET}")
+            bad(f"{tip.name}: no .ots after {fmt_age(age)} — NOT ANCHORED")
+        print(f"{DIM}        Records covered only by an unstamped tip have no independent "
+              f"timestamp.\n        (Maintainers: run ots_anchor.py, then check the "
+              f"stamping cron.){RESET}")
         return False
 
     if too_fresh:
-        warn(f"{too_fresh} tip(s) written in the last {grace_minutes} min, not yet stamped "
-             f"— fine, the cron has not run yet")
+        warn(f"{too_fresh} tip(s) committed in the last {grace_minutes} min, not yet "
+             f"stamped — expected, stamping runs on a schedule")
 
-    ok(f"all {len(list(anchors.glob('*.tip')))} tip(s) have an OpenTimestamps proof")
+    stamped = len(tips) - too_fresh
+    if stamped:
+        ok(f"{stamped} of {len(tips)} tip(s) have an OpenTimestamps proof")
     return True
 
 
@@ -190,24 +230,26 @@ def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
     confirmed = 0       # proofs backed by a Bitcoin block
     pending = 0         # stamped, awaiting confirmation — normal, not an error
     unverifiable = 0    # proof is fine; THIS MACHINE cannot check it
+    confirmed_seqs: list[int] = []
 
     for proof in proofs:
         tip_file = proof.with_suffix("")
         try:
             tip = json.loads(tip_file.read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            bad(f"{proof.name}: cannot read the tip it anchors: {e}")
+            tip_seq, tip_hash = tip["chain_seq"], tip["chain_hash"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+            bad(f"{proof.name}: cannot read the tip it anchors: {e!r}")
             failed = True
             continue
 
         # An anchor over a hash that isn't in the log proves nothing about the log.
-        record = by_seq.get(tip["chain_seq"])
+        record = by_seq.get(tip_seq)
         if not record:
-            bad(f"{proof.name}: anchors seq {tip['chain_seq']}, which is absent from the log")
+            bad(f"{proof.name}: anchors seq {tip_seq}, which is absent from the log")
             failed = True
             continue
-        if record["chain_hash"] != tip["chain_hash"]:
-            bad(f"{proof.name}: anchored hash != the log's hash at seq {tip['chain_seq']}")
+        if record["chain_hash"] != tip_hash:
+            bad(f"{proof.name}: anchored hash != the log's hash at seq {tip_seq}")
             failed = True
             continue
 
@@ -219,8 +261,9 @@ def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
         low = out.lower()
 
         if "success!" in low or "as of" in low:
-            ok(f"seq {tip['chain_seq']} anchored — {out.splitlines()[-1]}")
+            ok(f"seq {tip_seq} anchored — {out.splitlines()[-1]}")
             confirmed += 1
+            confirmed_seqs.append(tip_seq)
 
         elif "could not connect to bitcoin node" in low or "cookie file" in low:
             # The proof is fine — THIS MACHINE cannot check it. Reporting a
@@ -230,8 +273,8 @@ def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
 
         elif "pending" in low:
             pending += 1
-            warn(f"seq {tip['chain_seq']}: stamped, awaiting Bitcoin confirmation "
-                 f"(normal — takes a few hours; re-run ots_anchor.py to upgrade)")
+            warn(f"seq {tip_seq}: stamped, awaiting Bitcoin confirmation "
+                 f"(normal for a few hours after stamping)")
 
         else:
             bad(f"{proof.name}: {out[:160]}")
@@ -248,13 +291,11 @@ def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
         return None      # INCOMPLETE, not FAILED
 
     if confirmed:
-        newest = max(
-            json.loads(p.with_suffix("").read_text())["chain_seq"]
-            for p in proofs
-        )
+        # Only CONFIRMED anchors bound anything. A pending proof is a promise.
+        newest = max(confirmed_seqs)
         covered = sum(1 for r in records if r["chain_seq"] <= newest)
         print(f"{DIM}        {confirmed} confirmed anchor(s); records at or below the newest "
-              f"anchored tip ({covered}/{len(records)}) are timestamp-bounded{RESET}")
+              f"confirmed tip, seq {newest} ({covered}/{len(records)}), are timestamp-bounded{RESET}")
         if covered < len(records):
             warn(f"{len(records) - covered} record(s) are newer than the last confirmed anchor "
                  f"and are not yet independently timestamped")
@@ -314,7 +355,9 @@ def check_content(records: list[dict], api: str) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", type=Path, default=Path("."), help="path to the calibration-log checkout")
-    ap.add_argument("--fetch", action="store_true", help="also re-derive content hashes from the GRAILB API")
+    ap.add_argument("--fetch", action="store_true",
+                    help="also re-derive content hashes from an API that serves results "
+                         "(not public: the analyses name individual reviewers)")
     ap.add_argument("--grace", type=int, default=30,
                     help="minutes a fresh tip may go unstamped before it is an error")
     ap.add_argument("--api", default=DEFAULT_API,
@@ -337,9 +380,12 @@ def main() -> int:
     if args.fetch:
         content_ok = check_content(records, args.api)
     else:
-        print(f"\n{DIM}3. CONTENT — not checked (pass --fetch to re-derive hashes from the API){RESET}")
+        print(f"\n{DIM}3. CONTENT — not checked: the analyses are not public (they name "
+              f"individual reviewers). content_hash still commits to each one.{RESET}")
 
-    results = [stamped_ok, chain_ok, ts_ok, content_ok]
+    # content_ok is None when --fetch wasn't requested. That's not a check that
+    # failed to run; it's a check nobody asked for. Only count it if requested.
+    results = [stamped_ok, chain_ok, ts_ok] + ([content_ok] if args.fetch else [])
 
     print()
     if any(r is False for r in results):
@@ -352,12 +398,14 @@ def main() -> int:
         skipped = []
         if ts_ok is None:
             skipped.append("timestamps")
-        if content_ok is None:
+        if args.fetch and content_ok is None:
             skipped.append("content")
         print(f"{YELLOW}INCOMPLETE{RESET} — everything checked passed, but "
               f"{' and '.join(skipped)} could not be verified.\n")
         return 2
-    print(f"{GREEN}VERIFIED{RESET} — chain intact, timestamps confirmed against Bitcoin.\n")
+    print(f"{GREEN}VERIFIED{RESET} — chain intact, timestamps confirmed against Bitcoin"
+          + ("" if args.fetch else "; content not checked (the analyses are not public)")
+          + ".\n")
     return 0
 
 
