@@ -11,7 +11,9 @@ pip install opentimestamps-client
 python verify.py
 ```
 
-`verify.py` exits `0` (verified), `1` (failed) or `2` (incomplete: a check couldn't run on your machine, most often because `ots verify` needs a local Bitcoin node). Incomplete is not failed, and the script never reports a check as passed that it didn't run.
+`verify.py` exits `0` (verified), `1` (failed) or `2` (incomplete: a check couldn't run on your machine). Incomplete is not failed, and the script never reports a check as passed that it didn't run.
+
+You don't need a Bitcoin node. Without one, `verify.py` computes from your copy of each anchor the merkle root a specific Bitcoin block must have, then asks two independent public explorers (blockstream.info and mempool.space) for that block's real merkle root. The output says when it relied on them. If you'd rather trust nothing but your own node, pass `--no-explorer`.
 
 The scores, calls and per-PR results built on this log are at [grailb.com/calibration-log](https://grailb.com/calibration-log). Every number there can be traced to a `chain_seq` here.
 

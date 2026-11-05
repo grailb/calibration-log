@@ -24,9 +24,15 @@ What it checks, in order:
      a given Bitcoin block. Because each tip commits to all records before it,
      one confirmed anchor bounds the age of the entire history behind it.
 
-     `ots verify` needs a local Bitcoin node to look up the block header. With
-     no node, the proof cannot be checked *here* — that is INCOMPLETE, not
-     FAILED. `ots info <proof>` shows the attestation without any lookup.
+     `ots verify` normally checks against a local Bitcoin node. Most people
+     don't run one, so when it can't, this script falls back to public block
+     explorers: `ots --no-bitcoin verify` computes, from YOUR copy of the tip
+     file, the merkle root a specific Bitcoin block must have; two independent
+     explorers (blockstream.info, mempool.space) are asked what that block's
+     merkle root actually is. A match is reported as confirmed VIA EXPLORER,
+     which means trusting those explorers to report Bitcoin honestly. Pass
+     --no-explorer to refuse that trust; without a node the result is then
+     INCOMPLETE, not FAILED.
 
   3. CONTENT (optional, --fetch, needs network and an API that serves results)
      For each record, fetches the full analysis result and confirms it hashes
@@ -46,6 +52,7 @@ could not, e.g. no Bitcoin node or no `ots`).
 from __future__ import annotations
 
 import argparse
+import re
 import hashlib
 import json
 import os
@@ -209,7 +216,93 @@ def check_stamped(repo: Path, grace_minutes: int = 30) -> bool:
     return True
 
 
-def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
+# ── public block explorers (fallback when there is no local Bitcoin node) ────
+
+EXPLORERS = (
+    ("blockstream.info", "https://blockstream.info/api"),
+    ("mempool.space",    "https://mempool.space/api"),
+)
+_MANUAL_RE = re.compile(r"block\s+(\d+)\s+has\s+merkleroot\s+([0-9a-fA-F]{64})")
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_explorer_cache: dict[tuple[str, int], dict] = {}
+EXPLORERS_USED: set[str] = set()
+
+
+def _http_get(url: str, timeout: int = 15) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "grailb-verify/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _explorer_block(name: str, base: str, height: int) -> dict:
+    """{'merkle_root', 'time', 'hash'} for the block at `height`, or {'error'}."""
+    key = (name, height)
+    if key in _explorer_cache:
+        return _explorer_cache[key]
+    try:
+        block_hash = _http_get(f"{base}/block-height/{height}").decode().strip().lower()
+        if not _HEX64.match(block_hash):
+            raise ValueError(f"unexpected block hash {block_hash[:40]!r}")
+        block = json.loads(_http_get(f"{base}/block/{block_hash}"))
+        root = str(block.get("merkle_root", "")).lower()
+        if not _HEX64.match(root):
+            raise ValueError("no merkle_root in response")
+        result = {"merkle_root": root, "time": block.get("timestamp"), "hash": block_hash}
+    except Exception as e:  # network, TLS, JSON, shape: all mean "couldn't ask"
+        msg = str(e)
+        if "CERTIFICATE_VERIFY_FAILED" in msg:
+            msg += (" (on macOS with python.org Python, run 'Install Certificates.command' "
+                    "from the Python folder in Applications)")
+        result = {"error": msg[:200]}
+    _explorer_cache[key] = result
+    return result
+
+
+def _same_root(a: str, b: str) -> bool:
+    """Merkle roots are conventionally shown byte-reversed; accept either order."""
+    return a == b or a == bytes.fromhex(b)[::-1].hex()
+
+
+def check_via_explorers(repo: Path, proof: Path) -> tuple[str, str]:
+    """
+    Returns (state, message), state one of:
+      'confirmed'    every explorer that answered agrees with the proof
+      'mismatch'     an explorer reports a DIFFERENT merkle root: something is wrong
+      'unreachable'  the proof names a block, but no explorer could be asked
+      'none'         the proof has no Bitcoin attestation yet (pending)
+    """
+    proc = subprocess.run(
+        ["ots", "--no-bitcoin", "verify", str(proof.relative_to(repo))],
+        cwd=repo, capture_output=True, text=True,
+    )
+    out = proc.stdout + proc.stderr
+    if "does not match" in out.lower():
+        return "mismatch", "the tip file does not match the proof (ots: file does not match original)"
+    claims = {(int(h), r.lower()) for h, r in _MANUAL_RE.findall(out)}
+    if not claims:
+        return "none", out.strip()[:160]
+
+    # A proof can carry attestations from several calendars; one confirmed one suffices.
+    errors = []
+    for height, root in sorted(claims):
+        answers = {name: _explorer_block(name, base, height) for name, base in EXPLORERS}
+        good = {n: a for n, a in answers.items() if "error" not in a}
+        if not good:
+            errors.extend(f"{n}: {a['error']}" for n, a in answers.items())
+            continue
+        wrong = [n for n, a in good.items() if not _same_root(a["merkle_root"], root)]
+        if wrong:
+            return "mismatch", (f"block {height}: {', '.join(wrong)} report merkle root "
+                                f"{good[wrong[0]]['merkle_root'][:16]}…, the proof needs {root[:16]}…")
+        EXPLORERS_USED.update(good)
+        t = next((a["time"] for a in good.values() if a.get("time")), None)
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(t)) if t else "time unknown"
+        return "confirmed", (f"Bitcoin block {height} ({when}), merkle root agreed by "
+                             f"{' and '.join(sorted(good))}")
+    return "unreachable", "; ".join(errors)[:300]
+
+
+def check_timestamps(repo: Path, records: list[dict], use_explorers: bool = True) -> bool | None:
     """Returns True (verified), False (failed), or None (could not check)."""
     print("\n2. TIMESTAMPS")
 
@@ -231,6 +324,7 @@ def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
     pending = 0         # stamped, awaiting confirmation — normal, not an error
     unverifiable = 0    # proof is fine; THIS MACHINE cannot check it
     confirmed_seqs: list[int] = []
+    via_explorer = 0    # confirmed through public explorers, not a node
 
     for proof in proofs:
         tip_file = proof.with_suffix("")
@@ -265,10 +359,33 @@ def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
             confirmed += 1
             confirmed_seqs.append(tip_seq)
 
+        elif use_explorers and "does not match" not in low:
+            # No local node (the usual case). Ask public explorers instead.
+            state, msg = check_via_explorers(repo, proof)
+            if state == "confirmed":
+                ok(f"seq {tip_seq} anchored — {msg}")
+                confirmed += 1
+                via_explorer += 1
+                confirmed_seqs.append(tip_seq)
+            elif state == "mismatch":
+                bad(f"{proof.name}: {msg}")
+                failed = True
+            elif state == "unreachable":
+                warn(f"seq {tip_seq}: proof names a Bitcoin block, but no explorer could be "
+                     f"reached ({msg})")
+                unverifiable += 1
+            elif "pending" in low or "pending" in msg.lower():
+                pending += 1
+                warn(f"seq {tip_seq}: stamped, awaiting Bitcoin confirmation "
+                     f"(normal for a few hours after stamping)")
+            else:
+                bad(f"{proof.name}: {out[:160]}")
+                failed = True
+
         elif "could not connect to bitcoin node" in low or "cookie file" in low:
-            # The proof is fine — THIS MACHINE cannot check it. Reporting a
-            # failure here tells someone their log is broken when their laptop
-            # is merely missing a daemon. A verifier that cries wolf gets ignored.
+            # --no-explorer and no node: the proof may be fine, THIS MACHINE can't
+            # check it. Reporting a failure here tells someone their log is broken
+            # when their laptop is merely missing a daemon.
             unverifiable += 1
 
         elif "pending" in low:
@@ -283,12 +400,20 @@ def check_timestamps(repo: Path, records: list[dict]) -> bool | None:
     if failed:
         return False
 
-    if unverifiable:
-        warn(f"{unverifiable} proof(s) carry a Bitcoin attestation, but this machine "
-             f"has no Bitcoin node to check it against.")
-        print(f"{DIM}        The proofs are present and well-formed; only the lookup failed."
-              f"\n        Run a Bitcoin node, or inspect directly: ots info <proof>{RESET}")
+    if via_explorer:
+        print(f"{DIM}        {via_explorer} of these confirmed through public block explorers, "
+              f"not a Bitcoin node you run.\n        To remove that trust: run a node, or "
+              f"pass --no-explorer.{RESET}")
+
+    if unverifiable and not confirmed:
+        warn(f"{unverifiable} proof(s) carry a Bitcoin attestation that this machine "
+             f"could not check.")
+        print(f"{DIM}        The proofs are present; only the lookup failed. Run a Bitcoin "
+              f"node, allow network access, or inspect by hand:\n        "
+              f"ots --no-bitcoin verify <proof>  (prints the block and merkle root to look up){RESET}")
         return None      # INCOMPLETE, not FAILED
+    if unverifiable:
+        warn(f"{unverifiable} other proof(s) could not be checked from this machine")
 
     if confirmed:
         # Only CONFIRMED anchors bound anything. A pending proof is a promise.
@@ -358,6 +483,9 @@ def main() -> int:
     ap.add_argument("--fetch", action="store_true",
                     help="also re-derive content hashes from an API that serves results "
                          "(not public: the analyses name individual reviewers)")
+    ap.add_argument("--no-explorer", action="store_true",
+                    help="never consult public block explorers; without a local Bitcoin "
+                         "node, timestamps are then reported INCOMPLETE")
     ap.add_argument("--grace", type=int, default=30,
                     help="minutes a fresh tip may go unstamped before it is an error")
     ap.add_argument("--api", default=DEFAULT_API,
@@ -375,7 +503,7 @@ def main() -> int:
 
     stamped_ok = check_stamped(repo, args.grace)
     chain_ok = check_chain(records)
-    ts_ok = check_timestamps(repo, records)
+    ts_ok = check_timestamps(repo, records, use_explorers=not args.no_explorer)
     content_ok: bool | None = None
     if args.fetch:
         content_ok = check_content(records, args.api)
@@ -403,7 +531,9 @@ def main() -> int:
         print(f"{YELLOW}INCOMPLETE{RESET} — everything checked passed, but "
               f"{' and '.join(skipped)} could not be verified.\n")
         return 2
-    print(f"{GREEN}VERIFIED{RESET} — chain intact, timestamps confirmed against Bitcoin"
+    via = (f" (via {' and '.join(sorted(EXPLORERS_USED))}, not your own node)"
+           if EXPLORERS_USED else "")
+    print(f"{GREEN}VERIFIED{RESET} — chain intact, timestamps confirmed against Bitcoin{via}"
           + ("" if args.fetch else "; content not checked (the analyses are not public)")
           + ".\n")
     return 0
