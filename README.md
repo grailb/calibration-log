@@ -49,6 +49,7 @@ Each record's `content_hash` commits to the full analysis, but we don't publish 
 | `anchors/NNNNNN.tip` | A chain tip: `{"chain_seq": N, "chain_hash": "…"}`, the log as of sequence `NNNNNN`. |
 | `anchors/NNNNNN.tip.ots` | An OpenTimestamps proof anchoring that tip to the Bitcoin blockchain. |
 | `grailb_chain.py` | The canonical hash-chain definition. The same file runs in production. |
+| `grailb_policy.py` | When a PR may be sealed: what counts as a human response. The rule our crawler applies, written down so you can check it. |
 | `verify.py` | The verifier. Run it. |
 
 ## The record format
@@ -98,6 +99,34 @@ Being precise about this is the point of the exercise.
 - **Records newer than the last confirmed anchor are not yet independently timestamped.** OTS confirmation takes a few hours. `verify.py` tells you how many records fall into this window. Until an anchor confirms, the only timestamp on a record is GitHub's, which we could overwrite by force-pushing. Treat the unanchored tail with the skepticism it deserves.
 - **What the analyses say.** Not public; see below.
 - **That the log is complete with respect to reality.** The chain proves no record was removed *from the log*. If the instrument were never pointed at a PR at all, nothing here would show that.
+
+## Spot-checking a single pull request
+
+Our policy: **we never seal a PR once any human other than its author has responded.** A record proves that only if its earliest Bitcoin anchor came before the first such response, and before the PR resolved. You can check any record yourself, against GitHub and Bitcoin, without trusting us:
+
+```bash
+python verify.py --pr kubernetes/kubernetes#12345      # or paste the PR's URL
+python verify.py --seq 1840                            # by position in the log
+python verify.py --sample 20 --seed anything-you-like  # a random draw you can reproduce
+```
+
+For each record it prints our seal time, the earliest Bitcoin block that bounds the record, the PR's first human response, and its resolution, then one verdict:
+
+| Verdict | Meaning |
+|---|---|
+| `PROVED` | The anchor precedes any human response and the resolution. |
+| `NOT PROVABLE` | The anchor came after one of them. Our clock says we sealed first; Bitcoin can't confirm it. Expected for most of records 1 to 1051. |
+| `INCONCLUSIVE` | The anchor and the first event are within two hours of each other, inside the tolerance of Bitcoin's block timestamps (change with `--margin-hours`); or GitHub or the explorers couldn't be reached. |
+| `VIOLATION` | By our own clock, we sealed after a human had responded. That contradicts our policy and is a failure. |
+
+"Human response" is defined in `grailb_policy.py`. That's the rule our crawler applies before sealing. You don't have to take our word that it does: the spot-check holds every record to this rule using GitHub's own timestamps, so any seal that broke it shows up as a `VIOLATION`. Under the current version (`grailb-policy-v1`) it is an issue comment, an inline review comment, or a review *with text*, by anyone other than the PR's author and not a bot. Two consequences you should know about:
+
+- **A review with no text, such as a bare approval, does not count.** If one came before our seal, the spot-check prints a note saying so rather than hiding it.
+- **Any login ending in `bot` is treated as a bot**, as are accounts GitHub marks as bots and the accounts listed in `BOT_LOGINS`. A human whose login happens to end in `bot` would be missed.
+
+Reviewer names are never printed. Spot-checks need `pip install opentimestamps-client`. They make a few GitHub API calls per PR; for more than about fifteen PRs an hour, set `GITHUB_TOKEN` to any personal access token (no scopes needed).
+
+What a spot-check can't see: a comment that was deleted from GitHub before you checked.
 
 ## Checking the analyses
 

@@ -52,17 +52,21 @@ could not, e.g. no Bitcoin node or no `ots`).
 from __future__ import annotations
 
 import argparse
+import random
 import re
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 from grailb_chain import PUBLISHED_FIELDS, replay_chain
+from grailb_policy import POLICY_VERSION, RESPONSE_KINDS, counts_as_response, is_bot
 
 # There is deliberately no default here. --fetch is the only check that talks to
 # GRAILB's infrastructure, and it is optional by design: the chain and timestamp
@@ -477,12 +481,295 @@ def check_content(records: list[dict], api: str) -> bool:
     return passed
 
 
+# ── 4. spot-check single PRs (--pr / --seq / --sample) ──────────────────────
+#
+# The policy: GRAILB never seals a PR once any human other than its author has
+# responded. A record PROVES that only if its earliest Bitcoin anchor came
+# before the first such response (and before the PR resolved). This checks it,
+# one PR at a time, against GitHub and Bitcoin, without trusting GRAILB.
+
+# What counts as a human response lives in grailb_policy.py, the same file the
+# crawler runs, so this check applies the engine's rule exactly.
+
+BLOCK_TIME_MARGIN_H = 2   # Bitcoin header timestamps can be off by ~2 hours
+
+
+def _ts(iso: str | None) -> float | None:
+    if not iso:
+        return None
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _fmt(t: float | None) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(t)) if t is not None else "—"
+
+
+def _gh(path: str) -> tuple[object, str | None]:
+    """GET api.github.com/<path>; returns (json, next_page_url)."""
+    url = path if path.startswith("http") else f"https://api.github.com/{path}"
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "grailb-verify/1"}
+    if os.getenv("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            nxt = None
+            for part in (resp.headers.get("Link") or "").split(","):
+                if 'rel="next"' in part:
+                    nxt = part[part.find("<") + 1:part.find(">")]
+            return json.loads(resp.read()), nxt
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429):
+            raise RuntimeError("GitHub rate limit reached; set GITHUB_TOKEN to a personal "
+                               "access token (no scopes needed) and re-run") from None
+        raise RuntimeError(f"GitHub returned HTTP {e.code} for {url}") from None
+
+
+def _first_human_response(owner: str, repo: str, number: int, author: str):
+    """Earliest response that closes the prediction window under grailb_policy.
+    Returns (time, kind, bare_review_time). bare_review_time is the earliest
+    review by a human with no text, which policy v1 does not count; it's
+    reported, not judged. Logins are never printed."""
+    earliest, kind, bare = None, None, None
+    sources = (
+        (f"repos/{owner}/{repo}/issues/{number}/comments?per_page=100", "issue_comment", "comment"),
+        (f"repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100", "review", "review"),
+        (f"repos/{owner}/{repo}/pulls/{number}/comments?per_page=100", "review_comment", "review comment"),
+    )
+    for path, k, label in sources:
+        field = RESPONSE_KINDS[k]
+        url = path
+        while url:
+            items, url = _gh(url)
+            found = None
+            for it in items:
+                t = _ts(it.get(field))
+                if t is None:
+                    continue
+                if counts_as_response(k, it, author):
+                    found = t if found is None else min(found, t)
+                elif k == "review":
+                    u = it.get("user") or {}
+                    if not is_bot(u.get("login") or "", u.get("type", "")) and u.get("login") != author:
+                        bare = t if bare is None else min(bare, t)
+            if found is not None:
+                if earliest is None or found < earliest:
+                    earliest, kind = found, label
+                if k != "review":
+                    break   # chronological listing: later pages can't be earlier
+    return earliest, kind, bare
+
+
+_proof_index: list[dict] | None = None
+
+
+def _load_proofs(repo: Path, by_seq: dict) -> list[dict]:
+    """Every anchor whose .ots carries a Bitcoin attestation, parsed in-process.
+    Only anchors whose tip file matches the proof AND the log are kept."""
+    global _proof_index
+    if _proof_index is not None:
+        return _proof_index
+    try:
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.serialize import StreamDeserializationContext
+        from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
+    except ImportError:
+        sys.exit("spot-checks need the OpenTimestamps library: pip install opentimestamps-client")
+
+    out = []
+    for proof in sorted((repo / "anchors").glob("*.tip.ots")):
+        tip_file = proof.with_suffix("")
+        try:
+            raw = tip_file.read_bytes()
+            tip = json.loads(raw)
+            with open(proof, "rb") as f:
+                dtf = DetachedTimestampFile.deserialize(StreamDeserializationContext(f))
+        except Exception:
+            continue   # the full run reports unreadable anchors; here we just skip them
+        if dtf.file_digest != hashlib.sha256(raw).digest():
+            continue
+        rec = by_seq.get(tip.get("chain_seq"))
+        if not rec or rec["chain_hash"] != tip.get("chain_hash"):
+            continue
+        for msg, att in dtf.timestamp.all_attestations():
+            if isinstance(att, BitcoinBlockHeaderAttestation):
+                out.append({"seq": tip["chain_seq"], "height": att.height,
+                            "root": msg[::-1].hex(), "file": proof.name})
+    _proof_index = out
+    return out
+
+
+def _earliest_anchor(repo: Path, by_seq: dict, seq: int, use_explorers: bool) -> dict:
+    """The earliest Bitcoin block that bounds record `seq`: any anchor over a tip
+    at or after `seq` commits to it, so take the lowest block among them."""
+    cands = sorted((p for p in _load_proofs(repo, by_seq) if p["seq"] >= seq),
+                   key=lambda p: p["height"])
+    if not cands:
+        return {"state": "none"}
+    if not use_explorers:
+        c = cands[0]
+        return {"state": "no_time", "height": c["height"], "file": c["file"]}
+    errors = []
+    for c in cands[:5]:   # lowest first; fall through only if explorers can't answer
+        answers = {n: _explorer_block(n, b, c["height"]) for n, b in EXPLORERS}
+        good = {n: a for n, a in answers.items() if "error" not in a}
+        if not good:
+            errors += [a["error"] for a in answers.values()]
+            continue
+        wrong = [n for n, a in good.items() if not _same_root(a["merkle_root"], c["root"])]
+        if wrong:
+            return {"state": "mismatch", "file": c["file"], "height": c["height"],
+                    "explorers": wrong}
+        EXPLORERS_USED.update(good)
+        t = next((a["time"] for a in good.values() if a.get("time")), None)
+        return {"state": "confirmed", "height": c["height"], "time": t, "file": c["file"],
+                "explorers": sorted(good)}
+    return {"state": "unreachable", "error": "; ".join(errors)[:200]}
+
+
+_PR_RE = re.compile(r"(?:github\.com/)?([\w.-]+)/([\w.-]+)(?:#|/pull/)(\d+)")
+
+
+def spot_check(repo: Path, records: list[dict], targets: list[dict],
+               use_explorers: bool, margin_h: float) -> bool | None:
+    print(f"\n4. SPOT CHECK — {len(targets)} pull request(s)")
+    print(f"{DIM}        policy ({POLICY_VERSION}, see grailb_policy.py): no PR is sealed after "
+          f"any human other than its author has responded.\n        proved when the earliest Bitcoin anchor precedes that response "
+          f"and the resolution by > {margin_h:g} h.{RESET}")
+    by_seq = {r["chain_seq"]: r for r in records}
+    margin = margin_h * 3600
+    failed = inconclusive = False
+    tally = {"PROVED": 0, "NOT PROVABLE": 0, "INCONCLUSIVE": 0, "VIOLATION": 0,
+             "ANCHOR MISMATCH": 0}
+
+    for rec in targets:
+        seq, owner_repo, number = rec["chain_seq"], rec["repo"], rec["pr_number"]
+        print(f"\n  {owner_repo}#{number}  (seq {seq})")
+        sealed = _ts(rec.get("ran_at_iso"))
+        print(f"{DIM}        sealed, by our clock      {_fmt(sealed)}{RESET}")
+
+        anchor = _earliest_anchor(repo, by_seq, seq, use_explorers)
+        if anchor["state"] == "confirmed":
+            print(f"{DIM}        earliest anchor           Bitcoin block {anchor['height']}, "
+                  f"{_fmt(anchor['time'])} ({anchor['file']}, via {' and '.join(anchor['explorers'])}){RESET}")
+        elif anchor["state"] == "mismatch":
+            bad(f"{anchor['file']}: {', '.join(anchor['explorers'])} disagree with the proof "
+                f"about block {anchor['height']}")
+            tally["ANCHOR MISMATCH"] += 1
+            failed = True
+            continue
+        else:
+            why = {"none": "no confirmed anchor covers this record yet",
+                   "no_time": f"anchored in block {anchor.get('height')}, but --no-explorer leaves "
+                              f"no block time to compare; look it up on your node",
+                   "unreachable": f"no explorer reachable ({anchor.get('error')})"}[anchor["state"]]
+            warn(f"INCONCLUSIVE — {why}")
+            tally["INCONCLUSIVE"] += 1
+            inconclusive = True
+            continue
+
+        try:
+            owner, name = owner_repo.split("/", 1)
+            pr, _ = _gh(f"repos/{owner}/{name}/pulls/{number}")
+            author = (pr.get("user") or {}).get("login") or ""
+            resolved = _ts(pr.get("merged_at") or pr.get("closed_at"))
+            outcome = "merged" if pr.get("merged_at") else ("closed" if pr.get("closed_at") else "open")
+            first, kind, bare = _first_human_response(owner, name, number, author)
+        except Exception as e:
+            warn(f"INCONCLUSIVE — {e}")
+            tally["INCONCLUSIVE"] += 1
+            inconclusive = True
+            continue
+
+        print(f"{DIM}        first human response      "
+              f"{(_fmt(first) + ' (' + kind + ')') if first else 'none yet'}{RESET}")
+        if bare is not None and sealed is not None and bare < sealed and (first is None or bare < first):
+            print(f"{DIM}        note: a review with no text came at {_fmt(bare)}, before the seal. "
+                  f"{POLICY_VERSION} doesn't count those as a response.{RESET}")
+        print(f"{DIM}        resolved                  "
+              f"{(_fmt(resolved) + ' (' + outcome + ')') if resolved else 'still open'}{RESET}")
+
+        # Our own clock against the policy. Not proof of anything, but a seal
+        # that our clock places AFTER a human response contradicts the policy.
+        if sealed is not None and first is not None and sealed > first:
+            mins = (sealed - first) / 60
+            gap = f"{mins:.0f} min" if mins < 120 else f"{mins / 60:.1f} h"
+            bad(f"VIOLATION — sealed {_fmt(sealed)} by our own clock, {gap} after a human "
+                f"response at {_fmt(first)}")
+            tally["VIOLATION"] += 1
+            failed = True
+            continue
+
+        events = [t for t in (first, resolved) if t is not None]
+        t_anchor = anchor["time"]
+        if all(t_anchor + margin < t for t in events):
+            ok(f"PROVED — anchored {_fmt(t_anchor)}, before "
+               f"{'any human response or resolution' if events else 'anything has happened on the PR yet'}")
+            tally["PROVED"] += 1
+        elif any(t_anchor > t + margin for t in events):
+            print(f"  {YELLOW}NOT PROVABLE{RESET}  the anchor ({_fmt(t_anchor)}) came after "
+                  f"{'the first human response' if first and t_anchor > first + margin else 'the resolution'}. "
+                  f"Our clock says sealed first; Bitcoin can't confirm it.")
+            tally["NOT PROVABLE"] += 1
+        else:
+            warn(f"INCONCLUSIVE — anchor and the first event are within {margin_h:g} h of each "
+                 f"other, inside Bitcoin's timestamp tolerance")
+            tally["INCONCLUSIVE"] += 1
+            inconclusive = True
+
+    print("\n  " + ", ".join(f"{v} {k.lower()}" for k, v in tally.items() if v))
+    if failed:
+        return False
+    return None if inconclusive else True
+
+
+def pick_targets(records: list[dict], prs: list[str], seqs: list[int],
+                 sample: int, seed: str | None) -> list[dict]:
+    by_seq = {r["chain_seq"]: r for r in records}
+    by_pr = {(r["repo"].lower(), int(r["pr_number"])): r for r in records
+             if r.get("repo") and r.get("pr_number") is not None}
+    out = []
+    for p in prs:
+        m = _PR_RE.search(p)
+        if not m:
+            sys.exit(f"--pr {p!r}: expected owner/repo#123 or a pull request URL")
+        key = (f"{m.group(1)}/{m.group(2)}".lower(), int(m.group(3)))
+        if key not in by_pr:
+            sys.exit(f"--pr {p}: not in the log. GRAILB never sealed this pull request.")
+        out.append(by_pr[key])
+    for s in seqs:
+        if s not in by_seq:
+            sys.exit(f"--seq {s}: not in the log")
+        out.append(by_seq[s])
+    if sample:
+        seed = seed or str(random.SystemRandom().randrange(10**9))
+        print(f"{DIM}Sampling {sample} record(s) with --seed {seed} "
+              f"(re-run with the same seed to get the same sample){RESET}")
+        out += random.Random(seed).sample(records, min(sample, len(records)))
+    seen, uniq = set(), []
+    for r in out:
+        if r["chain_seq"] not in seen:
+            seen.add(r["chain_seq"])
+            uniq.append(r)
+    return uniq
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", type=Path, default=Path("."), help="path to the calibration-log checkout")
     ap.add_argument("--fetch", action="store_true",
                     help="also re-derive content hashes from an API that serves results "
                          "(not public: the analyses name individual reviewers)")
+    ap.add_argument("--pr", action="append", default=[], metavar="OWNER/REPO#N",
+                    help="spot-check one pull request (repeatable; a PR URL also works)")
+    ap.add_argument("--seq", action="append", default=[], type=int, metavar="N",
+                    help="spot-check the record at this chain_seq (repeatable)")
+    ap.add_argument("--sample", type=int, default=0, metavar="K",
+                    help="spot-check K records drawn at random")
+    ap.add_argument("--seed", help="seed for --sample, so anyone can reproduce the draw")
+    ap.add_argument("--margin-hours", type=float, default=BLOCK_TIME_MARGIN_H,
+                    help="required gap between anchor and response, for Bitcoin's "
+                         "timestamp tolerance (default 2)")
     ap.add_argument("--no-explorer", action="store_true",
                     help="never consult public block explorers; without a local Bitcoin "
                          "node, timestamps are then reported INCOMPLETE")
@@ -500,6 +787,21 @@ def main() -> int:
     records = load_records(repo / "calibration_log.jsonl")
 
     print(f"GRAILB calibration log — {len(records)} sealed record(s)")
+
+    if args.pr or args.seq or args.sample:
+        targets = pick_targets(records, args.pr, args.seq, args.sample, args.seed)
+        chain_ok = check_chain(records)
+        spot_ok = spot_check(repo, records, targets, not args.no_explorer, args.margin_hours)
+        print()
+        if not chain_ok or spot_ok is False:
+            print(f"{RED}FAILED{RESET} — see above.\n")
+            return 1
+        if spot_ok is None:
+            print(f"{YELLOW}INCOMPLETE{RESET} — no failures, but some checks were inconclusive.\n")
+            return 2
+        print(f"{GREEN}CHECKED{RESET} — chain intact; every spot-checked record is either proved "
+              f"or honestly reported as not provable.\n")
+        return 0
 
     stamped_ok = check_stamped(repo, args.grace)
     chain_ok = check_chain(records)
