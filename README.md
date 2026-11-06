@@ -75,6 +75,8 @@ Each record's `content_hash` commits to the full analysis, but we don't publish 
 
 `chain_hash` is the SHA-256 of these fields joined in a fixed order, including the previous record's `chain_hash`. `content_hash` is the SHA-256 of the full analysis result serialized as `json.dumps(result, sort_keys=True)`, with Python's default separators and `ensure_ascii`. Every record carries exactly these keys; `verify.py` rejects a line with more or fewer.
 
+What the seal covers: `chain_hash` commits to `content_hash` (the output), `trace_hash` (the retrieval trace, which also records the model) and `merged_hash` (the analytical layer), so every Bitcoin anchor fixes all three for every record before it. Records `1` to `180` seal only `content_hash`, and `181` to `186` seal `content_hash` and `trace_hash`; every record from `187` on seals all three. `verify.py` reports this on every run, so you don't have to take these numbers from us. `repo`, `pr_number` and `pr_url` aren't hashed directly, but `pr_identifier` is, and it equals `sha256("{repo}::pr::{pr_number}")`; `verify.py` recomputes it for every record, so a record can't be relabelled to a different pull request.
+
 ## What this proves
 
 **No prediction has been quietly removed.**
@@ -99,6 +101,7 @@ Being precise about this is the point of the exercise.
 - **An OTS proof is an upper bound, not an exact time.** It shows a hash existed *no later than* a Bitcoin block. It cannot show the hash wasn't created earlier. "Sealed before the PR resolved" is exactly an upper-bound claim, so this is the right direction, but it is not a claim that the timestamp is precise.
 - **Records newer than the last confirmed anchor are not yet independently timestamped.** OTS confirmation takes a few hours. `verify.py` tells you how many records fall into this window. Until an anchor confirms, the only timestamp on a record is GitHub's, which we could overwrite by force-pushing. Treat the unanchored tail with the skepticism it deserves.
 - **What the analyses say.** Not public; see below.
+- **Anything about the baselines.** The scores page compares GRAILB with two baseline models. Their readings are kept for our own record but aren't sealed in this log, so nothing here shows they weren't altered or rerun. Those comparisons rest on our word in a way GRAILB's own readings don't.
 - **That the log is complete with respect to reality.** The chain proves no record was removed *from the log*. If the instrument were never pointed at a PR at all, nothing here would show that.
 
 ## Spot-checking a single pull request

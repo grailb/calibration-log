@@ -170,6 +170,64 @@ def tip_written_at(repo: Path, tip: Path) -> float:
     return tip.stat().st_mtime
 
 
+def _ranges(seqs: list[int]) -> str:
+    """[1,2,3,7,9,10] -> '1–3, 7, 9–10' (first few ranges only)."""
+    out, start, prev = [], None, None
+    for s in sorted(seqs):
+        if start is None:
+            start = prev = s
+        elif s == prev + 1:
+            prev = s
+        else:
+            out.append(f"{start}–{prev}" if start != prev else f"{start}")
+            start = prev = s
+    if start is not None:
+        out.append(f"{start}–{prev}" if start != prev else f"{start}")
+    return ", ".join(out[:6]) + (f", and {len(out) - 6} more ranges" if len(out) > 6 else "")
+
+
+def check_identity(records: list[dict]) -> bool:
+    """Bind the readable fields to the sealed ones, and say what each seal covers.
+
+    repo, pr_number and pr_url are published but NOT in the chain preimage.
+    pr_identifier IS, and it is sha256("{repo}::pr::{pr_number}"). Recomputing
+    it is what stops a record being relabelled to a different pull request.
+    """
+    print("\n1b. PULL REQUEST IDENTITY AND SEAL COVERAGE")
+    wrong_id, wrong_url = [], []
+    for r in records:
+        expected = hashlib.sha256(f"{r['repo']}::pr::{r['pr_number']}".encode()).hexdigest()
+        if r["pr_identifier"] != expected:
+            wrong_id.append(r["chain_seq"])
+        if r.get("pr_url") and r["pr_url"].rstrip("/") != f"https://github.com/{r['repo']}/pull/{r['pr_number']}":
+            wrong_url.append(r["chain_seq"])
+
+    passed = True
+    if wrong_id:
+        bad(f"{len(wrong_id)} record(s) name a repo or PR number that doesn't match their sealed "
+            f"pr_identifier: seq {_ranges(wrong_id)}")
+        passed = False
+    else:
+        ok(f"every record's repo and PR number match its sealed pr_identifier")
+    if wrong_url:
+        bad(f"{len(wrong_url)} record(s) have a pr_url that doesn't match their repo and PR number: "
+            f"seq {_ranges(wrong_url)}")
+        passed = False
+
+    # What each seal commits to. Not a failure either way: just what's true.
+    no_trace = [r["chain_seq"] for r in records if not r.get("trace_hash")]
+    no_merged = [r["chain_seq"] for r in records if not r.get("merged_hash")]
+    full = len(records) - len(set(no_trace) | set(no_merged))
+    print(f"{DIM}        {full}/{len(records)} record(s) seal all three: content, trace and analytical hashes{RESET}")
+    if no_trace:
+        print(f"{DIM}        {len(no_trace)} seal no trace_hash (seq {_ranges(no_trace)}): their retrieval "
+              f"trace, and the model recorded in it, aren't committed{RESET}")
+    if no_merged:
+        print(f"{DIM}        {len(no_merged)} seal no merged_hash (seq {_ranges(no_merged)}): their "
+              f"analytical layer isn't committed{RESET}")
+    return passed
+
+
 def check_stamped(repo: Path, grace_minutes: int = 30) -> bool:
     """Every tip must have an .ots. A tip without one is a hole in the coverage.
 
@@ -306,7 +364,8 @@ def check_via_explorers(repo: Path, proof: Path) -> tuple[str, str]:
     return "unreachable", "; ".join(errors)[:300]
 
 
-def check_timestamps(repo: Path, records: list[dict], use_explorers: bool = True) -> bool | None:
+def check_timestamps(repo: Path, records: list[dict], use_explorers: bool = True,
+                     verbose: bool = False) -> bool | None:
     """Returns True (verified), False (failed), or None (could not check)."""
     print("\n2. TIMESTAMPS")
 
@@ -328,6 +387,7 @@ def check_timestamps(repo: Path, records: list[dict], use_explorers: bool = True
     pending = 0         # stamped, awaiting confirmation — normal, not an error
     unverifiable = 0    # proof is fine; THIS MACHINE cannot check it
     confirmed_seqs: list[int] = []
+    passed_by_block: dict[str, list[int]] = {}   # one PASS line per block, not per tip
     via_explorer = 0    # confirmed through public explorers, not a node
 
     for proof in proofs:
@@ -359,7 +419,7 @@ def check_timestamps(repo: Path, records: list[dict], use_explorers: bool = True
         low = out.lower()
 
         if "success!" in low or "as of" in low:
-            ok(f"seq {tip_seq} anchored — {out.splitlines()[-1]}")
+            passed_by_block.setdefault(out.splitlines()[-1], []).append(tip_seq)
             confirmed += 1
             confirmed_seqs.append(tip_seq)
 
@@ -367,7 +427,7 @@ def check_timestamps(repo: Path, records: list[dict], use_explorers: bool = True
             # No local node (the usual case). Ask public explorers instead.
             state, msg = check_via_explorers(repo, proof)
             if state == "confirmed":
-                ok(f"seq {tip_seq} anchored — {msg}")
+                passed_by_block.setdefault(msg, []).append(tip_seq)
                 confirmed += 1
                 via_explorer += 1
                 confirmed_seqs.append(tip_seq)
@@ -400,6 +460,14 @@ def check_timestamps(repo: Path, records: list[dict], use_explorers: bool = True
         else:
             bad(f"{proof.name}: {out[:160]}")
             failed = True
+
+    # One line per Bitcoin block, in seq order. --verbose prints every tip.
+    for msg, seqs in sorted(passed_by_block.items(), key=lambda kv: min(kv[1])):
+        if verbose:
+            for q in sorted(seqs):
+                ok(f"seq {q} anchored — {msg}")
+        else:
+            ok(f"{len(seqs)} tip(s), seq {_ranges(seqs)} — {msg}")
 
     if failed:
         return False
@@ -777,6 +845,8 @@ def main() -> int:
     ap.add_argument("--margin-hours", type=float, default=BLOCK_TIME_MARGIN_H,
                     help="required gap between anchor and response, for Bitcoin's "
                          "timestamp tolerance (default 2)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print a line for every anchor instead of one per Bitcoin block")
     ap.add_argument("--no-explorer", action="store_true",
                     help="never consult public block explorers; without a local Bitcoin "
                          "node, timestamps are then reported INCOMPLETE")
@@ -797,7 +867,7 @@ def main() -> int:
 
     if args.pr or args.seq or args.sample:
         targets = pick_targets(records, args.pr, args.seq, args.sample, args.seed)
-        chain_ok = check_chain(records)
+        chain_ok = check_chain(records) and check_identity(records)
         spot_ok = spot_check(repo, records, targets, not args.no_explorer, args.margin_hours)
         print()
         if not chain_ok or spot_ok is False:
@@ -813,7 +883,8 @@ def main() -> int:
 
     stamped_ok = check_stamped(repo, args.grace)
     chain_ok = check_chain(records)
-    ts_ok = check_timestamps(repo, records, use_explorers=not args.no_explorer)
+    id_ok = check_identity(records) if records else True
+    ts_ok = check_timestamps(repo, records, use_explorers=not args.no_explorer, verbose=args.verbose)
     content_ok: bool | None = None
     if args.fetch:
         content_ok = check_content(records, args.api)
@@ -823,7 +894,7 @@ def main() -> int:
 
     # content_ok is None when --fetch wasn't requested. That's not a check that
     # failed to run; it's a check nobody asked for. Only count it if requested.
-    results = [stamped_ok, chain_ok, ts_ok] + ([content_ok] if args.fetch else [])
+    results = [stamped_ok, chain_ok, id_ok, ts_ok] + ([content_ok] if args.fetch else [])
 
     print()
     if any(r is False for r in results):
