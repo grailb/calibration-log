@@ -28,11 +28,10 @@ Records `1` to `1051` were sealed and hash-chained, but at the time their only t
 What that means for those records, precisely:
 
 - **They can't have been altered or added after 2026-07-14 17:56 UTC.** That first anchor commits to the chain tip at the time, and the tip commits to every record before it. Changing any early record now would break the link to an anchor in Bitcoin.
-- **They can't be shown to have been sealed before their pull requests resolved,** for any PR that resolved before 2026-07-14. For those, you have our git history and our word, and you should weigh them accordingly.
-- **For early records whose PR resolved after 2026-07-14, the claim still holds**, because the anchor predates the outcome.
+- **For most of them, the claim at the top of this page can't be proved.** It can only be proved where the anchor came first: the PR's first reviewer response *and* its resolution both happened after 2026-07-14 17:56 UTC. For every other early record, you have our git history and our word, and you should weigh them accordingly.
 - **Some early records also show later anchors** (for example seq 1035 to 1049 in block 960000, 2026-07-28). These were stamped afterwards and add nothing; the 2026-07-14 anchor is the earliest bound on everything before it.
 
-From record `1052` on, each record is anchored to Bitcoin within hours of being sealed. `verify.py` reports any record that isn't.
+From record `1052` on, each record is anchored to Bitcoin within hours of being sealed. `verify.py` reports any record that isn't. The same rule applies to these: the claim is proved for a record when its anchor's block precedes the PR's first reviewer response. If a reviewer replied in the hours between seal and anchor, that record is in the same position as the early ones.
 
 We'd rather publish this than have someone find it.
 
@@ -94,7 +93,7 @@ Each `content_hash` commits to the full analysis. Whenever an analysis is shown 
 Being precise about this is the point of the exercise.
 
 - **It does not prove the predictions are any good.** That's what the scores are for. This log only establishes that they are *real* and *timely*.
-- **It does not prove that records 1 to 1051 were sealed before their pull requests resolved,** for any PR that resolved before 2026-07-14. See above.
+- **It does not prove a record was sealed before the first reviewer response unless its anchor's block came before that response.** That excludes most of records 1 to 1051 (see above), and any later record whose PR got a reply in the hours before its anchor confirmed.
 - **An OTS proof is an upper bound, not an exact time.** It shows a hash existed *no later than* a Bitcoin block. It cannot show the hash wasn't created earlier. "Sealed before the PR resolved" is exactly an upper-bound claim, so this is the right direction, but it is not a claim that the timestamp is precise.
 - **Records newer than the last confirmed anchor are not yet independently timestamped.** OTS confirmation takes a few hours. `verify.py` tells you how many records fall into this window. Until an anchor confirms, the only timestamp on a record is GitHub's, which we could overwrite by force-pushing. Treat the unanchored tail with the skepticism it deserves.
 - **What the analyses say.** Not public; see below.
