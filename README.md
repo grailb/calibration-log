@@ -95,6 +95,7 @@ Being precise about this is the point of the exercise.
 
 - **It does not prove the predictions are any good.** That's what the scores are for. This log only establishes that they are *real* and *timely*.
 - **It does not prove a record was sealed before the first reviewer response unless its anchor's block came before that response.** That excludes most of records 1 to 1051 (see above), and any later record whose PR got a reply in the hours before its anchor confirmed.
+- **That a fast-moving PR was sealed before its first human response.** Anchoring takes from under an hour to a few hours, and Bitcoin's block timestamps carry about two hours of tolerance, so a PR that got a response within roughly three hours of our seal can't be proved, even when our clock says we sealed first. See [Spot-checking a single pull request](#spot-checking-a-single-pull-request).
 - **An OTS proof is an upper bound, not an exact time.** It shows a hash existed *no later than* a Bitcoin block. It cannot show the hash wasn't created earlier. "Sealed before the PR resolved" is exactly an upper-bound claim, so this is the right direction, but it is not a claim that the timestamp is precise.
 - **Records newer than the last confirmed anchor are not yet independently timestamped.** OTS confirmation takes a few hours. `verify.py` tells you how many records fall into this window. Until an anchor confirms, the only timestamp on a record is GitHub's, which we could overwrite by force-pushing. Treat the unanchored tail with the skepticism it deserves.
 - **What the analyses say.** Not public; see below.
@@ -114,10 +115,17 @@ For each record it prints our seal time, the earliest Bitcoin block that bounds 
 
 | Verdict | Meaning |
 |---|---|
-| `PROVED` | The anchor precedes any human response and the resolution. |
-| `NOT PROVABLE` | The anchor came after one of them. Our clock says we sealed first; Bitcoin can't confirm it. Expected for most of records 1 to 1051. |
-| `INCONCLUSIVE` | The anchor and the first event are within two hours of each other, inside the tolerance of Bitcoin's block timestamps (change with `--margin-hours`); or GitHub or the explorers couldn't be reached. |
+| `PROVED` | The anchor came more than two hours before any human response and before the resolution. |
+| `NOT PROVABLE` | The anchor came after the first human response or the resolution, or less than two hours before it. Our clock may say we sealed first; Bitcoin can't confirm it. Expected for most of records 1 to 1051, and for any PR that got a human response within a few hours of being sealed. |
+| `INCONCLUSIVE` | Couldn't be checked: GitHub or the explorers couldn't be reached, or no confirmed anchor covers the record yet. |
 | `VIOLATION` | By our own clock, we sealed after a human had responded. That contradicts our policy and is a failure. |
+
+**Why a fast PR can't be proved, however honest the seal.** Two delays stack up:
+
+1. **Anchoring takes time.** A seal is submitted to OpenTimestamps calendars, which batch many hashes into one Bitcoin transaction, and that transaction then has to be mined into a block. This usually takes between under an hour and a few hours. Record 3279, for example, was sealed at 08:31 UTC and its anchor landed in a block at 09:18.
+2. **Bitcoin's clock is approximate.** A block's timestamp is set by whoever mined it and can be off by up to about two hours, so `verify.py` only counts an anchor as coming first if it came more than two hours before the event (`--margin-hours` changes this).
+
+Together, any PR that gets a human response within roughly three hours of being sealed can't be `PROVED`. Record 3279's first human comment came at 08:58, 27 minutes after our seal by our clock and 20 minutes before the anchor, so it is `NOT PROVABLE`. That's a limit of Bitcoin as a clock, not something we can engineer away, and it falls hardest on the pull requests that move fastest.
 
 "Human response" is defined in `grailb_policy.py`. That's the rule our crawler applies before sealing. You don't have to take our word that it does: the spot-check holds every record to this rule using GitHub's own timestamps, so any seal that broke it shows up as a `VIOLATION`. Under the current version (`grailb-policy-v1`) it is an issue comment, an inline review comment, or a review *with text*, by anyone other than the PR's author and not a bot. Two consequences you should know about:
 

@@ -703,19 +703,26 @@ def spot_check(repo: Path, records: list[dict], targets: list[dict],
         events = [t for t in (first, resolved) if t is not None]
         t_anchor = anchor["time"]
         if all(t_anchor + margin < t for t in events):
-            ok(f"PROVED — anchored {_fmt(t_anchor)}, before "
+            ok(f"PROVED — anchored {_fmt(t_anchor)}, more than {margin_h:g} h before "
                f"{'any human response or resolution' if events else 'anything has happened on the PR yet'}")
             tally["PROVED"] += 1
-        elif any(t_anchor > t + margin for t in events):
-            print(f"  {YELLOW}NOT PROVABLE{RESET}  the anchor ({_fmt(t_anchor)}) came after "
-                  f"{'the first human response' if first and t_anchor > first + margin else 'the resolution'}. "
-                  f"Our clock says sealed first; Bitcoin can't confirm it.")
-            tally["NOT PROVABLE"] += 1
         else:
-            warn(f"INCONCLUSIVE — anchor and the first event are within {margin_h:g} h of each "
-                 f"other, inside Bitcoin's timestamp tolerance")
-            tally["INCONCLUSIVE"] += 1
-            inconclusive = True
+            # Not proved. Name the event that blocks it and say by how much.
+            name, t_ev = (("the first human response", first)
+                          if first is not None and not (t_anchor + margin < first)
+                          else ("the resolution", resolved))
+            d = abs(t_anchor - t_ev) / 60
+            gap = f"{d:.0f} min" if d < 120 else f"{d / 60:.1f} h"
+            when = (f"came {gap} after {name}" if t_anchor >= t_ev
+                    else f"came only {gap} before {name}, inside Bitcoin's ~{margin_h:g} h timestamp tolerance")
+            ours = ""
+            if sealed is not None and sealed < t_ev:
+                s_gap = (t_ev - sealed) / 60
+                ours = (f" Our clock says sealed {s_gap:.0f} min before it"
+                        if s_gap < 120 else f" Our clock says sealed {s_gap / 60:.1f} h before it")
+                ours += "; Bitcoin can't confirm that."
+            print(f"  {YELLOW}NOT PROVABLE{RESET}  the anchor ({_fmt(t_anchor)}) {when}.{ours}")
+            tally["NOT PROVABLE"] += 1
 
     print("\n  " + ", ".join(f"{v} {k.lower()}" for k, v in tally.items() if v))
     if failed:
@@ -797,7 +804,8 @@ def main() -> int:
             print(f"{RED}FAILED{RESET} — see above.\n")
             return 1
         if spot_ok is None:
-            print(f"{YELLOW}INCOMPLETE{RESET} — no failures, but some checks were inconclusive.\n")
+            print(f"{YELLOW}INCOMPLETE{RESET} — no failures, but some records couldn't be checked "
+              f"(see INCONCLUSIVE above).\n")
             return 2
         print(f"{GREEN}CHECKED{RESET} — chain intact; every spot-checked record is either proved "
               f"or honestly reported as not provable.\n")
