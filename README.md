@@ -15,7 +15,7 @@ python verify.py
 
 You don't need a Bitcoin node. Without one, `verify.py` computes from your copy of each anchor the merkle root a specific Bitcoin block must have, then asks two independent public explorers (blockstream.info and mempool.space) for that block's real merkle root. The output says when it relied on them. If you'd rather trust nothing but your own node, pass `--no-explorer`.
 
-The scores, calls and per-PR results built on this log are at [grailb.com/calibration-log](https://grailb.com/calibration-log). Every number there traces to a `chain_seq` here.
+The scores, calls and per-PR results built on this log are at [log.grailb.com/calibration-log](https://log.grailb.com/calibration-log). Every number there traces to a `chain_seq` here.
 
 ---
 
