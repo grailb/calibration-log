@@ -277,3 +277,4 @@
 3377	anchored_late	2026-11-09T15:32:11Z
 3378	anchored_late	2026-11-09T16:09:01Z
 3379	anchored_late	2026-11-09T16:31:01Z
+3380	anchored_late	2026-11-09T17:29:00Z
