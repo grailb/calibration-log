@@ -315,3 +315,4 @@
 3585	anchored_late	2026-11-16T14:34:44Z
 3618	anchored_late	2026-11-17T00:37:29Z
 3651	anchored_late	2026-11-17T16:41:02Z
+4007	anchored_late	2026-11-25T16:09:14Z
